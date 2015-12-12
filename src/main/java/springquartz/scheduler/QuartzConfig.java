@@ -79,7 +79,7 @@ class QuartzConfig {
             log.info("Added job {}", businessJob.getClass());
         });
         if (triggers.isEmpty()) {
-            log.warn("No jobs added. Did you annotate your jobs with @BusinessJob?");
+            log.warn("No jobs added. Did you annotate your jobs with @Job?");
         }
         return triggers;
     }
