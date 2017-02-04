@@ -1,9 +1,13 @@
 package springquartz.scheduler;
 
 import com.google.common.collect.ImmutableMap;
+import org.quartz.DisallowConcurrentExecution;
 import org.quartz.JobDetail;
 import org.quartz.JobExecutionContext;
 import org.quartz.JobExecutionException;
+import org.quartz.JobKey;
+import org.quartz.Scheduler;
+import org.quartz.SchedulerException;
 import org.quartz.Trigger;
 import org.quartz.spi.JobFactory;
 import org.quartz.spi.TriggerFiredBundle;
@@ -28,8 +32,13 @@ import java.io.IOException;
 import java.lang.reflect.InvocationTargetException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 import java.util.Properties;
 
+import static java.util.Optional.ofNullable;
+import static java.util.stream.Collectors.reducing;
+import static java.util.stream.Collectors.toList;
+import static org.quartz.impl.matchers.GroupMatcher.jobGroupEquals;
 import static org.slf4j.LoggerFactory.getLogger;
 
 @Configuration
@@ -48,15 +57,23 @@ class QuartzConfig {
                                               final JobFactory jobFactory,
                                               final ApplicationContext applicationContext,
                                               final Environment environment) throws IOException {
-        SchedulerFactoryBean factory = new SchedulerFactoryBean();
+        List<Trigger> triggers = createJobs(applicationContext, environment);
+
+        SchedulerFactoryBean factory = new SelfCleaningUpScheduler(getJobKeys(triggers));
         // this allows to update triggers in DB when updating settings in config file:
         factory.setOverwriteExistingJobs(true);
         factory.setDataSource(dataSource);
         factory.setQuartzProperties(quartzProperties());
         factory.setJobFactory(jobFactory);
-        List<Trigger> triggers = addJobs(applicationContext, environment);
         factory.setTriggers(triggers.toArray(new Trigger[triggers.size()]));
         return factory;
+    }
+
+    private List<JobKey> getJobKeys(final List<Trigger> triggers) {
+        return triggers
+                .stream()
+                .map(Trigger::getJobKey)
+                .collect(toList());
     }
 
     private Properties quartzProperties() throws IOException {
@@ -66,22 +83,24 @@ class QuartzConfig {
         return propertiesFactoryBean.getObject();
     }
 
-    private List<Trigger> addJobs(final ApplicationContext applicationContext, final Environment environment) {
+    private List<Trigger> createJobs(final ApplicationContext applicationContext, final Environment environment) {
         List<Trigger> triggers = new ArrayList<>();
-        applicationContext.getBeansWithAnnotation(Job.class).forEach((name, businessJob) -> {
-            Job businessJobSpec = businessJob.getClass().getAnnotation(Job.class);
-
-            JobDetailFactoryBean jobDetail = createJobDetail(businessJob.getClass(), businessJobSpec.executableMethod());
-            CronTriggerFactoryBean trigger = createTrigger(jobDetail.getObject(), businessJob.getClass(),
-                    environment.resolvePlaceholders(businessJobSpec.cron()));
-
-            triggers.add(trigger.getObject());
-            log.info("Added job {}", businessJob.getClass());
-        });
+        applicationContext.getBeansWithAnnotation(Job.class).forEach((name, fromBusinessJob) -> triggers.add(createJob(fromBusinessJob, environment)));
         if (triggers.isEmpty()) {
             log.warn("No jobs added. Did you annotate your jobs with @Job?");
         }
         return triggers;
+    }
+
+    private Trigger createJob(final Object fromBusinessJob, final Environment environment) {
+        Job businessJobSpec = fromBusinessJob.getClass().getAnnotation(Job.class);
+
+        JobDetailFactoryBean jobDetail = createJobDetail(fromBusinessJob.getClass(), businessJobSpec.executableMethod());
+        CronTriggerFactoryBean trigger = createTrigger(jobDetail.getObject(), fromBusinessJob.getClass(),
+				environment.resolvePlaceholders(businessJobSpec.cron()));
+
+        log.info("Created a job {}", fromBusinessJob.getClass());
+        return trigger.getObject();
     }
 
     private JobDetailFactoryBean createJobDetail(final Class<?> businessJobClass, final String executableMethod) {
@@ -116,6 +135,7 @@ class QuartzConfig {
         }
     }
 
+    @DisallowConcurrentExecution
     public static class QuartzJob implements org.quartz.Job, ApplicationContextAware {
 
         private ApplicationContext applicationContext;
@@ -126,10 +146,7 @@ class QuartzConfig {
             String method = (String) context.getMergedJobDataMap().get("businessJob.method");
             Object bean = applicationContext.getBean(clazz);
             try {
-                Object result = clazz.getMethod(method).invoke(bean);
-                if (result != null) {
-                    context.setResult(result);
-                }
+                ofNullable(clazz.getMethod(method).invoke(bean)).ifPresent(context::setResult);
             } catch (NoSuchMethodException | IllegalAccessException | InvocationTargetException e) {
                 throw new IllegalStateException(e);
             }
@@ -154,6 +171,33 @@ class QuartzConfig {
             final Object job = super.createJobInstance(bundle);
             ((QuartzJob) job).setApplicationContext(applicationContext);
             return job;
+        }
+    }
+
+    private static class SelfCleaningUpScheduler extends SchedulerFactoryBean {
+
+        private final List<JobKey> currentJobKeys;
+
+        SelfCleaningUpScheduler(final List<JobKey> currentJobKeys) {
+            this.currentJobKeys = currentJobKeys;
+        }
+
+        @Override
+        public void afterPropertiesSet() throws Exception {
+            super.afterPropertiesSet();
+            deleteOrphanedJobs();
+        }
+
+        private void deleteOrphanedJobs() throws SchedulerException {
+            Scheduler scheduler = getScheduler();
+            for (String groupName : scheduler.getJobGroupNames()) {
+                for (JobKey jobKey : scheduler.getJobKeys(jobGroupEquals(groupName))) {
+                    if (!currentJobKeys.contains(jobKey)) {
+                        scheduler.deleteJob(jobKey);
+                        log.info("Deleted orphaned job: {}", jobKey);
+                    }
+                }
+            }
         }
     }
 }
